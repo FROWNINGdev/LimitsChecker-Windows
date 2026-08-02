@@ -317,11 +317,11 @@ $Worker = {
             }
             if ($code -eq 429) {
                 # The API's own wording is long and repeats on every retry; the
-                # menu only needs "we are throttled, next try in N s".
-                $when = if ($null -ne $retryAfter -and $retryAfter -gt 0) {
-                    ' - retry in ' + [int][math]::Ceiling($retryAfter) + 's'
-                } else { '' }
-                return @{ Ok = $false; Error = "rate-limited (429)$when"; Transient = $true; RetryAfter = $retryAfter }
+                # menu only needs the status - the UI appends when it will ask
+                # again. Without a Retry-After header, wait a full refresh cycle
+                # rather than the shorter default: asking sooner just fails.
+                if ($null -eq $retryAfter -or $retryAfter -le 0) { $retryAfter = 60.0 }
+                return @{ Ok = $false; Error = 'rate-limited (429)'; Transient = $true; RetryAfter = $retryAfter; RateLimited = $true }
             }
             if ($code -ge 500) {
                 return @{ Ok = $false; Error = "server error (HTTP $code)"; Transient = $true; RetryAfter = $retryAfter }
@@ -336,6 +336,10 @@ $Worker = {
     for ($attempt = 0; $attempt -lt $cfg.Attempts; $attempt++) {
         $result = Invoke-Once $cfg
         if ($result.Ok -or -not $result.Transient) { break }
+        # A 429 never clears within a few seconds, and retrying inside the poll
+        # only deepens the throttle. Hand it straight to the retry timer, which
+        # waits out Retry-After.
+        if ($result.RateLimited) { break }
         if ($attempt + 1 -lt $cfg.Attempts) {
             # Short in-fetch backoff only; longer waits belong to the retry timer.
             $delay = if ($null -ne $result.RetryAfter) { $result.RetryAfter } else { 1 + $attempt * 2 }
@@ -828,6 +832,8 @@ $script:PowerShell  = $null
 $script:Handle      = $null
 $script:Runspace    = $null
 $script:RetryDue    = $null
+# Consecutive 429s, used to widen the retry gap while the API is throttling us.
+$script:RateLimitStreak = 0
 
 # A row spec is either
 #   @{ Type = 'bar';  Name; Pct; Tail }        - colored progress row
@@ -953,7 +959,21 @@ function Complete-Fetch {
     if (-not $result.Ok) {
         $after = $null
         try { if ($null -ne $result.RetryAfter) { $after = [double]$result.RetryAfter } } catch { }
-        Apply-Error ([string]$result.Error) ([bool]$result.Transient) $after
+        $limited = $false
+        try { $limited = [bool]$result.RateLimited } catch { }
+        if ($limited) {
+            # Each consecutive 429 doubles the wait (60s, 2m, 4m ... 10m cap) so
+            # a long throttle is ridden out quietly instead of re-asked every
+            # minute. Any successful poll resets the streak.
+            $script:RateLimitStreak = [int]$script:RateLimitStreak + 1
+            $factor = [math]::Pow(2, [math]::Min($script:RateLimitStreak - 1, 8))
+            $scaled = $after * $factor
+            if ($scaled -gt 600) { $scaled = 600 }
+            $after = $scaled
+        } else {
+            $script:RateLimitStreak = 0
+        }
+        Apply-Error ([string]$result.Error) ([bool]$result.Transient) $after $limited
         return
     }
 
@@ -970,6 +990,7 @@ function Complete-Fetch {
 
 function Apply-Ok($view, [string]$raw) {
     $script:RetryDue = $null
+    $script:RateLimitStreak = 0
     $script:LastView = $view
     $script:LastRaw = $raw
     $script:LastError = $null
@@ -994,7 +1015,26 @@ function Format-NoteLine([string]$text, [int]$max) {
     return $one
 }
 
-function Apply-Error([string]$message, [bool]$transient, $retryAfter = $null) {
+function Apply-Error([string]$message, [bool]$transient, $retryAfter = $null, [bool]$showNextTry = $false) {
+    # Transient failures retry soon; auth/other failures back off further so we
+    # do not hammer a dead token (it recovers when Claude Code refreshes it).
+    $delay = if ($transient) { $RETRY_SECONDS } else { $RETRY_SECONDS * 4 }
+    # A 429 with Retry-After tells us exactly when the window opens; waiting less
+    # than that only earns another 429, so honour it (capped so the tray does not
+    # go quiet for hours on a bogus header).
+    if ($null -ne $retryAfter) {
+        $hinted = [double]$retryAfter
+        if ($hinted -gt 3600) { $hinted = 3600 }
+        if ($hinted -gt $delay) { $delay = $hinted }
+    }
+    $script:RetryDue = (Get-Date).AddSeconds($delay)
+    # Say when we will ask again, computed from the delay actually scheduled.
+    if ($showNextTry) {
+        $secs = [int][math]::Ceiling($delay)
+        $when = if ($secs -ge 60) { '' + [int][math]::Round($secs / 60.0) + 'm' } else { "${secs}s" }
+        $message = "$message - next try in $when"
+    }
+
     $script:LastError = $message
     $view = $script:LastView
     if ($null -ne $view) {
@@ -1016,18 +1056,6 @@ function Apply-Error([string]$message, [bool]$transient, $retryAfter = $null) {
         Set-TrayIcon $notify 0 $false $true
         $script:Details = "${APP_TITLE}: ERROR: $message"
     }
-    # Transient failures retry soon; auth/other failures back off further so we
-    # do not hammer a dead token (it recovers when Claude Code refreshes it).
-    $delay = if ($transient) { $RETRY_SECONDS } else { $RETRY_SECONDS * 4 }
-    # A 429 with Retry-After tells us exactly when the window opens; waiting less
-    # than that only earns another 429, so honour it (capped so the tray does not
-    # go quiet for hours on a bogus header).
-    if ($null -ne $retryAfter) {
-        $hinted = [double]$retryAfter
-        if ($hinted -gt 3600) { $hinted = 3600 }
-        if ($hinted -gt $delay) { $delay = $hinted }
-    }
-    $script:RetryDue = (Get-Date).AddSeconds($delay)
 }
 
 # --------------------------------------------------------------------- timers
@@ -1043,6 +1071,11 @@ $timer.Add_Tick({
             if ($script:Handle.IsCompleted) {
                 Complete-Fetch
                 $script:NextPoll = (Get-Date).AddSeconds($REFRESH_SECONDS)
+                # A back-off longer than the refresh cycle must win, or the
+                # regular poll would fire first and undo the wait.
+                if ($null -ne $script:RetryDue -and $script:RetryDue -gt $script:NextPoll) {
+                    $script:NextPoll = $script:RetryDue
+                }
             }
             return
         }
