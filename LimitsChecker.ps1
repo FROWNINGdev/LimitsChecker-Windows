@@ -232,6 +232,40 @@ $Worker = {
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     } catch { }
 
+    # API errors come back as {"type":"error","error":{"type":..,"message":..}}.
+    # The menu note is one short line, so pull just the human message out and
+    # never let a raw JSON blob (or an HTML gateway page) reach the UI.
+    function Get-ErrorDetail([string]$body, [string]$fallback) {
+        $text = ''
+        if (-not [string]::IsNullOrWhiteSpace($body)) {
+            $trimmed = $body.Trim()
+            if ($trimmed.StartsWith('{')) {
+                try {
+                    $obj = $trimmed | ConvertFrom-Json
+                    $msg = $null
+                    $err = $obj.PSObject.Properties['error']
+                    if ($err -and $err.Value) {
+                        $inner = $err.Value.PSObject.Properties['message']
+                        if ($inner) { $msg = [string]$inner.Value }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($msg)) {
+                        $top = $obj.PSObject.Properties['message']
+                        if ($top) { $msg = [string]$top.Value }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($msg)) { $text = $msg }
+                } catch { }
+            } elseif (-not $trimmed.StartsWith('<')) {
+                # Plain-text body is usable as-is; an HTML gateway page is noise.
+                $text = $trimmed
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($text)) { $text = $fallback }
+        if ($null -eq $text) { $text = '' }
+        $text = ($text -replace '\s+', ' ').Trim()
+        if ($text.Length -gt 90) { $text = $text.Substring(0, 89).TrimEnd() + [string][char]0x2026 }
+        return $text
+    }
+
     function Invoke-Once($cfg) {
         $req = [System.Net.HttpWebRequest]::Create($cfg.Endpoint)
         $req.Method           = 'GET'
@@ -264,8 +298,8 @@ $Worker = {
                 $body = $reader.ReadToEnd()
                 $reader.Close()
             } catch { }
-            if ($body.Length -gt 300) { $body = $body.Substring(0, 300) }
-            if ([string]::IsNullOrWhiteSpace($body)) { $body = $we.Message }
+            if ($body.Length -gt 2000) { $body = $body.Substring(0, 2000) }
+            $detail = Get-ErrorDetail $body $we.Message
             $retryAfter = $null
             try {
                 $hdr = $resp.Headers['Retry-After']
@@ -281,11 +315,18 @@ $Worker = {
                 # Claude Code (or a re-login) refreshes the credentials.
                 return @{ Ok = $false; Error = '401 unauthorized - token invalid/expired, re-login to Claude'; Transient = $false; RetryAfter = $null }
             }
-            if ($code -eq 429 -or $code -ge 500) {
-                $label = if ($code -eq 429) { '429 rate-limited' } else { "HTTP $code" }
-                return @{ Ok = $false; Error = "${label}: $body"; Transient = $true; RetryAfter = $retryAfter }
+            if ($code -eq 429) {
+                # The API's own wording is long and repeats on every retry; the
+                # menu only needs "we are throttled, next try in N s".
+                $when = if ($null -ne $retryAfter -and $retryAfter -gt 0) {
+                    ' - retry in ' + [int][math]::Ceiling($retryAfter) + 's'
+                } else { '' }
+                return @{ Ok = $false; Error = "rate-limited (429)$when"; Transient = $true; RetryAfter = $retryAfter }
             }
-            return @{ Ok = $false; Error = "HTTP ${code}: $body"; Transient = $false; RetryAfter = $null }
+            if ($code -ge 500) {
+                return @{ Ok = $false; Error = "server error (HTTP $code)"; Transient = $true; RetryAfter = $retryAfter }
+            }
+            return @{ Ok = $false; Error = "HTTP ${code}: $detail"; Transient = $false; RetryAfter = $null }
         } catch {
             return @{ Ok = $false; Error = "network error: $($_.Exception.Message)"; Transient = $true; RetryAfter = $null }
         }
@@ -909,7 +950,12 @@ function Complete-Fetch {
     }
 
     if ($null -eq $result) { Apply-Error 'worker returned nothing' $true; return }
-    if (-not $result.Ok) { Apply-Error ([string]$result.Error) ([bool]$result.Transient); return }
+    if (-not $result.Ok) {
+        $after = $null
+        try { if ($null -ne $result.RetryAfter) { $after = [double]$result.RetryAfter } } catch { }
+        Apply-Error ([string]$result.Error) ([bool]$result.Transient) $after
+        return
+    }
 
     try {
         $payload = $result.Raw | ConvertFrom-Json
@@ -939,7 +985,16 @@ function Apply-Ok($view, [string]$raw) {
     $script:WasWarning = [bool]$view.Warn
 }
 
-function Apply-Error([string]$message, [bool]$transient) {
+# The menu note is a single line, so any multi-line message (an exception, a
+# stray JSON body) is flattened before it can wrap the panel.
+function Format-NoteLine([string]$text, [int]$max) {
+    if ($null -eq $text) { return '' }
+    $one = ($text -replace '\s+', ' ').Trim()
+    if ($one.Length -gt $max) { $one = $one.Substring(0, $max - 1).TrimEnd() + [string][char]0x2026 }
+    return $one
+}
+
+function Apply-Error([string]$message, [bool]$transient, $retryAfter = $null) {
     $script:LastError = $message
     $view = $script:LastView
     if ($null -ne $view) {
@@ -947,8 +1002,7 @@ function Apply-Error([string]$message, [bool]$transient) {
         # numbers visible, note the failure at the foot of the menu, and let the
         # retry timer recover - most blips clear within one try.
         $rows = @(Build-RowSpecs $view)
-        $note = ($WARN + 'last update failed - retrying ' + [char]0x00B7 + ' ' + $message)
-        if ($note.Length -gt 120) { $note = $note.Substring(0, 120) }
+        $note = Format-NoteLine ($WARN + 'last update failed - retrying ' + [char]0x00B7 + ' ' + $message) 100
         $rows += New-NoteSpec $note 'warn'
         Set-Rows $rows
         Set-Tooltip (Format-PanelLabel $view)
@@ -956,8 +1010,7 @@ function Apply-Error([string]$message, [bool]$transient) {
         $script:Details = (Format-DetailsText $view) + "`r`n`r`n" + $WARN + "last update failed: $message"
     } else {
         # No good data yet (e.g. first poll on a dead token) - surface it.
-        $line = ($WARN + "ERROR: $message")
-        if ($line.Length -gt 120) { $line = $line.Substring(0, 120) }
+        $line = Format-NoteLine ($WARN + "ERROR: $message") 100
         Set-Rows @((New-NoteSpec $line 'warn'))
         Set-Tooltip ($WARN + 'error')
         Set-TrayIcon $notify 0 $false $true
@@ -966,6 +1019,14 @@ function Apply-Error([string]$message, [bool]$transient) {
     # Transient failures retry soon; auth/other failures back off further so we
     # do not hammer a dead token (it recovers when Claude Code refreshes it).
     $delay = if ($transient) { $RETRY_SECONDS } else { $RETRY_SECONDS * 4 }
+    # A 429 with Retry-After tells us exactly when the window opens; waiting less
+    # than that only earns another 429, so honour it (capped so the tray does not
+    # go quiet for hours on a bogus header).
+    if ($null -ne $retryAfter) {
+        $hinted = [double]$retryAfter
+        if ($hinted -gt 3600) { $hinted = 3600 }
+        if ($hinted -gt $delay) { $delay = $hinted }
+    }
     $script:RetryDue = (Get-Date).AddSeconds($delay)
 }
 
