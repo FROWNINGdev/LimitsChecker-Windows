@@ -60,8 +60,16 @@ the equivalent of the macOS keychain path.
 The network call runs in a background runspace, so a slow response never freezes
 the menu. A single failed poll does not blank the numbers: the last good values
 stay, an error line appears at the bottom of the menu, and the next attempt
-happens after `RETRY_SECONDS` (four times longer for 401). 429 and 5xx are
-treated as transient and retried inside the poll, honoring `Retry-After`.
+happens after `RETRY_SECONDS` (four times longer for 401). 5xx is treated as
+transient and retried inside the poll; a 429 skips those extra attempts and
+widens the gap instead (1m, 2m, 4m, 8m, up to 10m), honoring `Retry-After`.
+
+Each good poll is cached, so a restart shows the last known numbers right away
+— marked with their age — instead of an empty panel while the first poll runs.
+
+The endpoint admits roughly one request every two minutes per token, which is
+why the default poll interval is three minutes. Lowering `REFRESH_SECONDS`
+below that trades fresher numbers for a 429 on every other poll.
 
 ## Requirements
 
@@ -117,7 +125,7 @@ default and is clamped to its range, so a stray variable never blocks startup.
 | `..._CREDENTIAL_TARGET` | `Claude Code-credentials` | Credential Manager entry name (fallback token source) |
 | `..._ENDPOINT` | `https://api.anthropic.com/api/oauth/usage` | Usage endpoint |
 | `..._BETA` | `oauth-2025-04-20` | Value of the `anthropic-beta` header |
-| `..._REFRESH_SECONDS` | `60` | Poll interval, seconds (minimum 5) |
+| `..._REFRESH_SECONDS` | `180` | Poll interval, seconds (minimum 5) |
 | `..._RETRY_SECONDS` | `30` | Pause before retrying after a failure, seconds |
 | `..._FETCH_ATTEMPTS` | `3` | Attempts within one poll (1–10) |
 | `..._TIMEOUT` | `30` | HTTP timeout, seconds |
@@ -133,6 +141,7 @@ default and is clamped to its range, so a stray variable never blocks startup.
 | `..._NAME_SESSION` / `..._NAME_WEEK` | `Session` / `Week` | Window labels |
 | `..._ICON` | — | Path to a custom `.ico` instead of the drawn icon |
 | `..._TITLE` | `LimitsChecker` | App and details-window title |
+| `..._CACHE` | `%LOCALAPPDATA%\LimitsChecker\usage-cache.json` | Last good payload, shown at startup while the first poll runs |
 
 To make the variables apply to the autostarted instance too, set them for the
 user:

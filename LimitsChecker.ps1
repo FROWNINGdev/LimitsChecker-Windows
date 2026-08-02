@@ -170,7 +170,10 @@ $CREDENTIALS = Get-EnvStr 'CREDENTIALS' (Join-Path $env:USERPROFILE '.claude\.cr
 $CRED_TARGET = Get-EnvStr 'CREDENTIAL_TARGET' 'Claude Code-credentials'
 $ENDPOINT    = Get-EnvStr 'ENDPOINT' 'https://api.anthropic.com/api/oauth/usage'
 $BETA_HEADER = Get-EnvStr 'BETA' 'oauth-2025-04-20'
-$REFRESH_SECONDS = Get-EnvInt 'REFRESH_SECONDS' 60 5 $null
+# The usage endpoint admits roughly one request every two minutes per token;
+# polling faster earns a 429 on every other try. Three minutes stays clear of
+# that with room for a manual refresh, and these windows move slowly anyway.
+$REFRESH_SECONDS = Get-EnvInt 'REFRESH_SECONDS' 180 5 $null
 # After a failed poll, retry this soon instead of waiting the full refresh cycle.
 $RETRY_SECONDS   = Get-EnvInt 'RETRY_SECONDS' 30 5 $null
 # Attempts per poll to ride out a transient blip (rate-limit / network hiccup).
@@ -187,6 +190,9 @@ $SHOW_SCOPED     = Get-EnvBool 'SHOW_SCOPED' $true
 $SCOPED_INACTIVE = Get-EnvBool 'SCOPED_INACTIVE' $false
 $NOTIFY          = Get-EnvBool 'NOTIFY' $true
 $ICON_PATH       = Get-EnvStr 'ICON' ''
+# Last good payload, so a restart shows numbers immediately instead of an empty
+# panel while the first poll is in flight (or throttled).
+$CACHE_FILE      = Get-EnvStr 'CACHE' (Join-Path $env:LOCALAPPDATA 'LimitsChecker\usage-cache.json')
 $MENU_FONT       = Get-EnvStr 'MENU_FONT' 'Segoe UI'
 $ROW_SLOTS       = 12   # reusable menu rows for usage windows (generous)
 
@@ -1004,6 +1010,51 @@ function Apply-Ok($view, [string]$raw) {
         try { $notify.ShowBalloonTip(10000, $APP_TITLE, $label, [System.Windows.Forms.ToolTipIcon]::Warning) } catch { }
     }
     $script:WasWarning = [bool]$view.Warn
+    Save-Cache $raw
+}
+
+# The cache holds only the endpoint's usage percentages - no token, no identity.
+# A write failure is never worth surfacing: the tray works fine without it.
+function Save-Cache([string]$raw) {
+    if ([string]::IsNullOrWhiteSpace($CACHE_FILE) -or [string]::IsNullOrWhiteSpace($raw)) { return }
+    try {
+        $dir = Split-Path -Parent $CACHE_FILE
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        # Write beside the target and move, so a crash mid-write cannot leave a
+        # truncated file that the next start would reject.
+        $tmp = $CACHE_FILE + '.tmp'
+        Set-Content -LiteralPath $tmp -Value $raw -Encoding UTF8 -NoNewline
+        Move-Item -LiteralPath $tmp -Destination $CACHE_FILE -Force
+    } catch { }
+}
+
+# Render the cached payload at startup, flagged as stale, so a first poll that
+# is slow or rate-limited never leaves the menu blank.
+function Restore-Cache {
+    if ([string]::IsNullOrWhiteSpace($CACHE_FILE)) { return }
+    if (-not (Test-Path -LiteralPath $CACHE_FILE -PathType Leaf)) { return }
+    try {
+        $raw = Get-Content -LiteralPath $CACHE_FILE -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return }
+        $age = (Get-Date) - (Get-Item -LiteralPath $CACHE_FILE).LastWriteTime
+        # Percentages age out - a week-old snapshot says nothing useful, and
+        # showing it as if current would be worse than showing nothing.
+        if ($age.TotalDays -gt 7) { return }
+        $stamp = if ($age.TotalMinutes -lt 60) { '' + [int][math]::Max(1, [math]::Floor($age.TotalMinutes)) + 'm' }
+                 elseif ($age.TotalHours -lt 24) { '' + [int][math]::Floor($age.TotalHours) + 'h' }
+                 else { '' + [int][math]::Floor($age.TotalDays) + 'd' }
+        $view = Build-View ($raw | ConvertFrom-Json)
+        $script:LastView = $view
+        $script:LastRaw  = $raw
+        $rows = @(Build-RowSpecs $view)
+        $rows += New-NoteSpec ("cached $stamp ago " + [char]0x00B7 + ' refreshing...') 'muted'
+        Set-Rows $rows
+        Set-Tooltip (Format-PanelLabel $view)
+        Set-TrayIcon $notify ([int]$view.Peak) ([bool]$view.Warn) $false
+        $script:Details = Format-DetailsText $view
+    } catch { }
 }
 
 # The menu note is a single line, so any multi-line message (an exception, a
@@ -1143,6 +1194,7 @@ $miQuit.Add_Click({
     [System.Windows.Forms.Application]::Exit()
 })
 
+Restore-Cache
 Start-Fetch
 [System.Windows.Forms.Application]::Run((New-Object System.Windows.Forms.ApplicationContext))
 try { $mutex.ReleaseMutex() } catch { }
